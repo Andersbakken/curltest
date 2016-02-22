@@ -66,7 +66,7 @@ static size_t dataCallback(void * data, size_t size, size_t nmemb, void * userda
 }
 
 struct Request {
-    const char *url;
+    char *url;
     struct Request *next;
     char httpVersion[4];
     CURL *easy;
@@ -75,8 +75,8 @@ struct Request {
 
 static struct Request *create(struct Request *head, const char *url)
 {
-    struct Request *req = (struct Request*)calloc(sizeof(struct Request), 1);
-    req->url = url;
+    struct Request *req = (struct Request*)calloc(1, sizeof(struct Request));
+    req->url = strdup(url);
     if (!head) {
         head = req;
     } else {
@@ -93,7 +93,7 @@ static int addRequest(CURLM *multi, struct Request **reqPtr)
     struct Request *req = *reqPtr;
     req->easy = curl_easy_init();
     CURL_CALL(curl_easy_setopt(req->easy, CURLOPT_URL, req->url));
-    LOG("SETTING URL %s - %p\n", req->url, req->easy);
+    VLOG("SETTING URL %s - %p\n", req->url, req->easy);
     CURL_CALL(curl_easy_setopt(req->easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0));
     CURL_CALL(curl_easy_setopt(req->easy, CURLOPT_HEADERFUNCTION, headerCallback));
     CURL_CALL(curl_easy_setopt(req->easy, CURLOPT_HEADERDATA, &req->httpVersion));
@@ -130,7 +130,7 @@ static int process(CURLM *multi, struct Request **head)
 
         if (maxFD > 0) {
             VLOG("SELECTING for %ld.%03ld (%ld)\n",
-                 t.tv_sec, t.tv_usec / 1000, maxTime);
+                 t.tv_sec, (long)(t.tv_usec / 1000), maxTime);
             const int ret = select(maxFD , &r, &w, 0, &t);
             if (ret == -1 && errno == EINTR)
                 continue;
@@ -138,7 +138,8 @@ static int process(CURLM *multi, struct Request **head)
 
         CURLMcode m;
         do {
-            m = curl_multi_perform(multi, 0);
+            int tmp;
+            m = curl_multi_perform(multi, &tmp);
         } while (m == CURLM_CALL_MULTI_PERFORM);
 
         if (m) {
@@ -147,7 +148,8 @@ static int process(CURLM *multi, struct Request **head)
         }
 
         CURLMsg *msg;
-        while ((msg = curl_multi_info_read(multi, 0)) != 0) {
+        int tmp;
+        while ((msg = curl_multi_info_read(multi, &tmp)) != 0) {
             if (msg->msg == CURLMSG_DONE) {
                 struct Request *req = *head;
                 struct Request *prev = 0;
@@ -175,6 +177,7 @@ static int process(CURLM *multi, struct Request **head)
                 /* VLOG("ABOUT TO CLEANUP %p\n", ((struct SessionHandle*)easy->easy_conn); */
                 curl_multi_remove_handle(multi, msg->easy_handle);
                 curl_easy_cleanup(msg->easy_handle);
+                free(req->url);
                 free(req);
                 done = 1;
                 break;
@@ -187,13 +190,14 @@ static int process(CURLM *multi, struct Request **head)
 
 int main(int argc, char **argv)
 {
+    const char *urlPrefix = "https://dtaserver.corp.netflix.com:8081/files";
     const char *urls[] = {
-        "https://dtaserver.corp.netflix.com:8081/files/data-1k",
-        "https://dtaserver.corp.netflix.com:8081/files/data-10k",
-        "https://dtaserver.corp.netflix.com:8081/files/data-100k",
-        "https://dtaserver.corp.netflix.com:8081/files/data-1m",
-        "https://dtaserver.corp.netflix.com:8081/files/data-10m",
-        "https://dtaserver.corp.netflix.com:8081/files/data-50m"
+        "/data-1k",
+        "/data-10k",
+        "/data-100k",
+        "/data-1m",
+        "/data-10m",
+        "/data-50m"
     };
     enum {
         Parallel,
@@ -204,17 +208,23 @@ int main(int argc, char **argv)
             mode = Parallel;
         } else if (!strcmp(argv[i], "--sequential") || !strcmp(argv[i], "-s")) {
             mode = Sequential;
+        } else if (!strncmp(argv[i], "--url-prefix=", 13)) {
+            urlPrefix = argv[i] + 13;
         }
     }
 
     struct Request *head = 0;
     const size_t count = sizeof(urls) / sizeof(urls[0]);
-    for (size_t i=0; count; ++i) {
-        head = create(head, urls[i]);
+    for (size_t i=0; i<count; ++i) {
+        char url[1024];
+        snprintf(url, sizeof(url), "%s%s", urlPrefix, urls[i]);
+        head = create(head, url);
     }
+
     struct Request *next = head;
 
     CURLM *multi = curl_multi_init();
+    assert(multi);
     CURLM_CALL(curl_multi_setopt(multi, CURLMOPT_PIPELINING, CURLPIPE_HTTP1|CURLPIPE_MULTIPLEX));
     if (mode == Parallel) {
         while (next) {
